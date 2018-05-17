@@ -23,6 +23,7 @@ import simplejson as json
 from twisted.internet import defer
 
 from synapse.storage.events_worker import EventsWorkerStore
+from synapse.storage.chunk_ordered_table import ChunkDBOrderedListStore
 from synapse.util.async import ObservableDeferred
 from synapse.util.frozenutils import frozendict_json_encoder
 from synapse.util.logcontext import (
@@ -1019,13 +1020,17 @@ class EventsStore(EventsWorkerStore):
                     }
                 )
 
-                sql = (
-                    "UPDATE events SET outlier = ?"
-                    " WHERE event_id = ?"
-                )
-                txn.execute(
-                    sql,
-                    (False, event.event_id,)
+                chunk_id, topo = self._compute_chunk_id_txn(txn, event)
+
+                self._simple_update_txn(
+                    txn,
+                    table="events",
+                    keyvalues={"event_id": event.event_id},
+                    updatevalues={
+                        "outlier": False,
+                        "chunk_id": chunk_id,
+                        "topological_ordering": topo,
+                    },
                 )
 
                 # Update the event_backward_extremities table now that this
@@ -1108,13 +1113,16 @@ class EventsStore(EventsWorkerStore):
             ],
         )
 
+        chunk_id, topological_ordering = self._compute_chunk_id_txn(txn, event)
+
         self._simple_insert_many_txn(
             txn,
             table="events",
             values=[
                 {
                     "stream_ordering": event.internal_metadata.stream_ordering,
-                    "topological_ordering": event.depth,
+                    "chunk_id": chunk_id,
+                    "topological_ordering": topological_ordering,
                     "depth": event.depth,
                     "event_id": event.event_id,
                     "room_id": event.room_id,
@@ -1343,6 +1351,162 @@ class EventsStore(EventsWorkerStore):
             "INSERT INTO redactions (event_id, redacts) VALUES (?,?)",
             (event.event_id, event.redacts)
         )
+
+    def _compute_chunk_id_txn(self, txn, event):
+        """Computes the chunk ID and topological ordering for an event.
+
+        Also handles updating chunk_graph table.
+
+        Args:
+            txn,
+            event (EventBase)
+
+        Returns:
+            tuple[int, int]: Returns the chunk_id, topological_ordering for
+            the event
+        """
+        if event.internal_metadata.is_outlier():
+            return None, 0
+
+        prev_chunk_ids = set()
+        for eid, _ in event.prev_events:
+            chunk_id = self._simple_select_one_onecol_txn(
+                txn,
+                table="events",
+                keyvalues={"event_id": eid},
+                retcol="chunk_id",
+                allow_none=True,
+            )
+
+            # TODO: Handle null chunk, rather than just non-existent event
+
+            if chunk_id is not None:
+                prev_chunk_ids.add(chunk_id)
+
+        forward_events = self._simple_select_onecol_txn(
+            txn,
+            table="event_edges",
+            keyvalues={
+                "prev_event_id": event.event_id,
+                "is_state": False,
+            },
+            retcol="event_id",
+        )
+
+        forward_chunk_ids = set()
+        prev_events = set()
+        for eid in set(forward_events):
+            chunk_id = self._simple_select_one_onecol_txn(
+                txn,
+                table="events",
+                keyvalues={"event_id": eid},
+                retcol="chunk_id",
+                allow_none=True,
+            )
+
+            pes = self._simple_select_onecol_txn(
+                txn,
+                table="event_edges",
+                keyvalues={
+                    "event_id": eid,
+                    "is_state": False,
+                },
+                retcol="prev_event_id",
+            )
+
+            prev_events.update(pes)
+
+            # TODO: Handle null chunk, rather than just non-existent event
+
+            if chunk_id is not None:
+                forward_chunk_ids.add(chunk_id)
+
+        self.table = ChunkDBOrderedListStore(
+            txn, event.room_id, self.clock,
+        )
+
+        if len(prev_chunk_ids) == 1:
+            chunk_id = list(prev_chunk_ids)[0]
+            new_topo = self._simple_select_one_onecol_txn(
+                txn,
+                table="events",
+                keyvalues={
+                    "room_id": event.room_id,
+                    "chunk_id": chunk_id,
+                },
+                retcol="COALESCE(MAX(topological_ordering), 0)",
+            )
+            new_topo += 1
+        elif len(prev_chunk_ids) > 1:
+            chunk_id = self._chunk_id_gen.get_next()
+            self.table.add_node(chunk_id)
+            new_topo = 0
+        elif len(prev_events) == 1 and len(forward_chunk_ids) == 1:
+            chunk_id = list(forward_chunk_ids)[0]
+            new_topo = self._simple_select_one_onecol_txn(
+                txn,
+                table="events",
+                keyvalues={
+                    "room_id": event.room_id,
+                    "chunk_id": chunk_id,
+                },
+                retcol="COALESCE(MIN(topological_ordering), 0)",
+            )
+            new_topo -= 1
+        else:
+            chunk_id = self._chunk_id_gen.get_next()
+            self.table.add_node(chunk_id)
+            new_topo = 0
+
+        current_prev_ids = self._simple_select_onecol_txn(
+            txn,
+            table="chunk_graph",
+            keyvalues={
+                "chunk_id": chunk_id,
+            },
+            retcol="prev_id",
+        )
+
+        current_forward_ids = self._simple_select_onecol_txn(
+            txn,
+            table="chunk_graph",
+            keyvalues={
+                "prev_id": chunk_id,
+            },
+            retcol="chunk_id",
+        )
+
+        prev_chunk_ids = set(
+            pid for pid in prev_chunk_ids
+            if pid not in current_prev_ids and pid != chunk_id
+        )
+        forward_chunk_ids = set(
+            fid for fid in forward_chunk_ids
+            if fid not in current_forward_ids and fid != chunk_id
+        )
+
+        if prev_chunk_ids:
+            for pid in prev_chunk_ids:
+                # Note that the edge direction is reveresed
+                self.table.add_edge(pid, chunk_id)
+
+        if forward_chunk_ids:
+            for fid in forward_chunk_ids:
+                # Note that the edge direction is reveresed
+                self.table.add_edge(chunk_id, fid)
+
+        txn.executemany("""
+            INSERT INTO chunk_backwards_extremities (chunk_id, event_id)
+            SELECT ?, ? WHERE ? NOT IN (SELECT event_id FROM events)
+        """, [(chunk_id, eid, eid) for eid, _ in event.prev_events])
+
+        self._simple_delete_txn(
+            txn,
+            table="chunk_backwards_extremities",
+            keyvalues={"event_id": event.event_id},
+        )
+
+        return chunk_id, new_topo
 
     @defer.inlineCallbacks
     def have_events_in_timeline(self, event_ids):
